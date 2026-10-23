@@ -1,0 +1,98 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+
+# ABSTRACT: Convert a DOS MZ executable to a binary image
+
+=head1 SYNOPSIS
+
+ scripts/exe2bin [--base SEG] [--size BYTES] IN.EXE OUT.BIN
+
+=head1 DESCRIPTION
+
+Replacement for the DOS C<EXE2BIN> utility as used by the MS-DOS 4.00 build.
+Writes the load image of C<IN.EXE> (the file without its header) to
+C<OUT.BIN>:
+
+=over 4
+
+=item *
+
+if the entry point is C<0000:0100>, the image is a C<.COM> program and its
+first 256 bytes (the PSP area) are dropped;
+
+=item *
+
+segment relocations are applied by adding the base segment given with
+C<--base> (hexadecimal, as typed at EXE2BIN's "Fix-ups needed - base
+segment" prompt).  An executable with relocations and no C<--base> is an
+error, as it is for EXE2BIN;
+
+=item *
+
+with C<--size>, the load image is padded with zeros to that many bytes
+before the PSP area of a C<.COM> program is dropped (see
+F<scripts/mslink-layout>).
+
+=back
+
+This replaces Open Watcom's C<exe2bin>, which loses the carry when it adds
+the base segment to a relocated word.
+
+=cut
+
+sub main (@args) {
+  my($base, $size);
+  while(@args && $args[0] =~ /^--/) {
+    my $opt = shift @args;
+    if($opt eq '--base') {
+      $base = hex shift @args;
+    } elsif($opt eq '--size') {
+      $size = shift @args;
+    } else {
+      die "unknown option $opt\n";
+    }
+  }
+  die "usage: $0 [--base SEG] [--size BYTES] IN.EXE OUT.BIN\n" unless @args == 2;
+  my($in, $out) = @args;
+
+  open my $fh, '<:raw', $in or die "unable to read $in: $!";
+  my $exe = do { local $/; <$fh> };
+  close $fh;
+
+  my($magic, $last, $pages, $nrel, $hdr, undef, undef, undef, undef, undef, $ip, $cs, $reloff)
+    = unpack 'a2 v12', $exe;
+  die "$in: not an MZ executable\n" unless $magic eq 'MZ';
+
+  my $file_size = $pages * 512 - ($last ? 512 - $last : 0);
+  my $image = substr $exe, $hdr * 16, $file_size - $hdr * 16;
+
+  if($nrel) {
+    die "$in: relocations present, --base needed\n" unless defined $base;
+    for my $i (0 .. $nrel - 1) {
+      my($off, $seg) = unpack 'v v', substr($exe, $reloff + 4 * $i, 4);
+      my $at = $seg * 16 + $off;
+      my $word = unpack 'v', substr($image, $at, 2);
+      substr($image, $at, 2) = pack 'v', ($word + $base) & 0xffff;
+    }
+  }
+
+  if(defined $size) {
+    die "$in: image is ", length $image, " bytes, larger than $size\n" if length $image > $size;
+    $image .= "\0" x ($size - length $image);
+  }
+
+  if($cs == 0 && $ip == 0x100) {
+    $image = substr $image, 0x100;
+  } elsif($cs != 0 || $ip != 0) {
+    die sprintf "%s: entry point %04X:%04X cannot be converted\n", $in, $cs, $ip;
+  }
+
+  open $fh, '>:raw', $out or die "unable to write $out: $!";
+  print $fh $image;
+  close $fh or die "unable to write $out: $!";
+  return 0;
+}
+
+exit main(@ARGV);

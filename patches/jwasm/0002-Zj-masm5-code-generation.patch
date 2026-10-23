@@ -1,0 +1,377 @@
+JWasm: -Zj, Masm 5 code generation
+
+Masm 5 is a two-pass assembler that fixes the size of every instruction in
+pass one and never shrinks it.  -Zj makes JWasm generate the same code:
+
+ - a forward JMP reserves 3 bytes; a forward reference in the second
+   operand of an instruction with a register destination is a memory
+   operand; a forward referenced variable is a WORD (the 80/83 group keeps
+   the short form if the immediate fits in a byte); later passes pad an
+   instruction that turned out shorter with NOPs (EB xx 90, ...)
+ - a forward reference in a displacement keeps the 16-bit displacement
+ - AX, imm uses the accumulator form, not opcode 83
+ - EVEN/ALIGN pad with 90h in a segment that contains instructions, else
+   with zeros, and always write the padding
+ - a structure name that is an operand of + or - is 0;
+   number + struct field has the type of the field
+ - fixups always have an explicit frame (no F5 "frame of target")
+
+This is what GR-DOS needs to reproduce the MS-DOS 4.00 binaries built
+with MASM 5.10 byte for byte; see docs/m2-jwasm.md.
+
+diff --git a/src/H/globals.h b/src/H/globals.h
+index 8ec7a1e..5c90d9b 100644
+--- a/src/H/globals.h
++++ b/src/H/globals.h
+@@ -611,6 +611,7 @@ struct global_options {
+     bool        convert_uppercase;       /* -C<p|x|u> options */
+     bool        preprocessor_stdout;     /* -EP option  */
+     bool        masm51_compat;           /* -Zm option  */
++    bool        masm5_compat;            /* -Zj option  */
+     bool        strict_masm_compat;      /* -Zne option  */
+     bool        masm_compat_gencode;     /* -Zg option  */
+     bool        masm8_proc_visibility;   /* -Zv8 option  */
+diff --git a/src/H/parser.h b/src/H/parser.h
+index 71cc836..96670ee 100644
+--- a/src/H/parser.h
++++ b/src/H/parser.h
+@@ -318,6 +318,9 @@ extern void       set_frame( const struct asym *sym );
+ extern void       set_frame2( const struct asym *sym );
+ extern ret_code   ParseLine( struct asm_tok[] );
+ extern void       ProcessFile( struct asm_tok[] );
++extern void       Masm5PassInit( void );
++extern bool       Masm5FwdRef;
++extern void       Masm5Pad( enum instr_token, uint_32 );
+ 
+ extern void       WritePreprocessedLine( const char * );
+ 
+diff --git a/src/H/symbols.h b/src/H/symbols.h
+index dea8d7a..d48c245 100644
+--- a/src/H/symbols.h
++++ b/src/H/symbols.h
+@@ -334,6 +334,7 @@ struct seg_info {
+     unsigned char       internal:1;     /* internal segment with private buffer */
+     unsigned char       written:1;      /* code/data just written */
+     unsigned char       linnum_init:1;  /* v2.10: linnum data emitted for segment? */
++    unsigned char       masm5_code:1;   /* -Zj: segment contains instructions */
+     unsigned char       combine:3;      /* combine type, see omfspec.h */
+ #if COMDATSUPP
+     unsigned char       comdat_selection:3; /* if > 0, it's a COMDAT (COFF/OMF) */
+diff --git a/src/H/usage.h b/src/H/usage.h
+index 8048ac7..7c3dd69 100644
+--- a/src/H/usage.h
++++ b/src/H/usage.h
+@@ -71,6 +71,7 @@
+ "-zl{f|p|s}\0"      "Suppress items in COFF symbol table: f=no .file entry,\0"
+ "\0"                "p=no static procs, s=no auxiliary entries for sections\0"
+ #endif
++"-Zj\0"             "Masm v5.1 code generation: instruction sizes fixed in pass one\0"
+ "-Zm\0"             "Masm v5.1 compatibility\0"
+ "-Zne\0"            "Disable syntax extensions not supported by Masm\0"
+ "-Zp[n]\0"          "Set structure alignment, n=<1|2|4|8|16|32>\0"
+diff --git a/src/assemble.c b/src/assemble.c
+index 600b19f..65dcd87 100644
+--- a/src/assemble.c
++++ b/src/assemble.c
+@@ -983,6 +983,7 @@ static int OnePass( void )
+     ModulePassInit();
+     SymPassInit( Parse_Pass );
+     LabelInit();
++    Masm5PassInit();
+     SegmentInit( Parse_Pass );
+     ContextInit( Parse_Pass );
+     ProcInit();
+diff --git a/src/branch.c b/src/branch.c
+index 14d4473..acf7588 100644
+--- a/src/branch.c
++++ b/src/branch.c
+@@ -503,6 +503,14 @@ ret_code process_branch( struct code_info *CodeInfo, unsigned CurrOpnd, const st
+             /* forward reference
+              * default distance is short, we will expand later if needed
+              */
++            if ( Options.masm5_compat && CodeInfo->token == T_JMP &&
++                opndx->instr != T_SHORT && CodeInfo->Ofssize == USE16 ) {
++                /* -Zj: MASM 5 reserves 3 bytes for a forward JMP */
++                CodeInfo->opnd[OPND1].type = OP_I16;
++                fixup_type = FIX_RELOFF16;
++                fixup_option = OPTJ_NONE;
++                break;
++            }
+             CodeInfo->opnd[OPND1].type = OP_I8;
+             fixup_type = FIX_RELOFF8;
+             fixup_option = (opndx->instr == T_SHORT) ? OPTJ_EXPLICIT : OPTJ_NONE;
+diff --git a/src/cmdline.c b/src/cmdline.c
+index 381e4a1..0e8e3b4 100644
+--- a/src/cmdline.c
++++ b/src/cmdline.c
+@@ -126,6 +126,7 @@ struct global_options Options = {
+     /* convert_uppercase     */     FALSE,
+     /* preprocessor_stdout   */     FALSE,
+     /* masm51_compat         */     FALSE,
++    /* masm5_compat          */     FALSE,
+     /* strict_masm_compat    */     FALSE,
+     /* masm_compat_gencode   */     FALSE,
+     /* masm8_proc_visibility */     FALSE,
+@@ -702,6 +703,7 @@ static struct cmdloption const cmdl_options[] = {
+ #if DLLIMPORT
+     { "Zli",    optofs( local_imports ), Set_True },
+ #endif
++    { "Zj",     optofs( masm5_compat ),       Set_True },
+     { "Zm",     optofs( masm51_compat ),      Set_True },
+     { "Zne",    optofs( strict_masm_compat ), Set_True },
+     { "Zp=#",   0,        Set_Zp },
+diff --git a/src/codegen.c b/src/codegen.c
+index 56283de..58696bd 100644
+--- a/src/codegen.c
++++ b/src/codegen.c
+@@ -930,6 +930,10 @@ ret_code codegen( struct code_info *CodeInfo )
+         if ( tbl_op1 == OP_NONE && opnd1 == OP_NONE ) {
+             output_opc( CodeInfo );
+             return( NOT_ERROR );
++        } else if ( Options.masm5_compat && tbl_op1 == OP_RGT8 &&
++                   CodeInfo->pinstr->opcode == 0x83 &&
++                   ( opnd1 & OP_AX ) == OP_AX ) {
++            /* -Zj: Masm 5 uses the accumulator form for AX, imm */
+         } else if ( opnd1 & tbl_op1 ) {
+             /* for immediate operands, the idata type has sometimes
+              * to be modified in opnd_type[OPND1], to make output_data()
+diff --git a/src/expreval.c b/src/expreval.c
+index eec6c60..54e35a8 100644
+--- a/src/expreval.c
++++ b/src/expreval.c
+@@ -555,6 +555,7 @@ static ret_code get_operand( struct expr *opnd, int *idx, struct asm_tok tokenar
+             //if( Parse_Pass == PASS_1 ) {
+             if( Parse_Pass == PASS_1 && !( flags & EXPF_NOUNDEF ) ) {
+                 /* if symbol wasn't found, assume it is a forward ref! */
++                Masm5FwdRef = TRUE;
+                 if ( sym == NULL ) {
+                     /* v2.11: flag EXPF_NOLCREATE has got another meaning */
+                     //if ( opnd->type == NULL && !( flags & EXPF_NOLCREATE ) ) { /* added v1.95 */
+@@ -665,6 +666,13 @@ static ret_code get_operand( struct expr *opnd, int *idx, struct asm_tok tokenar
+                     opnd->value = GetTypeSize( sym->mem_type, sym->Ofssize );
+             } else
+                 opnd->value = sym->total_size;
++            /* -Zj: in Masm 5, a structure name that is an operand of
++             * binary '+' or '-' (not of SIZE, TYPE, ...) is 0 */
++            if ( Options.masm5_compat && sym->typekind == TYPE_STRUCT &&
++                ( i == 0 || tokenarray[i-1].token != T_UNARY_OPERATOR ) &&
++                ( ( i > 0 && ( tokenarray[i-1].token == '+' || tokenarray[i-1].token == '-' ) ) ||
++                 tokenarray[i+1].token == '+' || tokenarray[i+1].token == '-' ) )
++                opnd->value = 0;
+ 
+             break;
+         case SYM_STRUCT_FIELD:
+@@ -1772,6 +1780,12 @@ static ret_code plus_op( struct expr *opnd1, struct expr *opnd2 )
+ 
+         DebugMsg1(("plus_op: CONST - CONST\n" ));
+         opnd1->llvalue += opnd2->llvalue;
++        /* -Zj: in Masm 5, number + struct field has the field's type */
++        if ( Options.masm5_compat && opnd1->mem_type == MT_EMPTY &&
++            opnd1->mbr == NULL && opnd1->is_type == FALSE && opnd2->mbr != NULL ) {
++            opnd1->mem_type = opnd2->mem_type;
++            opnd1->mbr = opnd2->mbr;
++        }
+ 
+     } else if( check_same( opnd1, opnd2, EXPR_ADDR ) ) {
+ 
+diff --git a/src/omffixup.c b/src/omffixup.c
+index 56a0558..43f0221 100644
+--- a/src/omffixup.c
++++ b/src/omffixup.c
+@@ -389,7 +389,8 @@ static int omf_set_logref( const struct fixup *fixup, struct logref *lr )
+      * will be optimized.
+     */
+ 
+-    if( lr->frame_meth == ( lr->target_meth - TARGET_SEG ) ) {
++    /* -Zj: Masm 5 always writes the frame explicitly */
++    if( lr->frame_meth == ( lr->target_meth - TARGET_SEG ) && Options.masm5_compat == FALSE ) {
+         DebugMsg1(("omf_set_logref: fixup optimized, frame_meth=%u, target_meth=%u\n", lr->frame_meth, lr->target_meth ));
+         lr->frame_meth = FRAME_TARG; /* frame same as target */
+     }
+diff --git a/src/parser.c b/src/parser.c
+index ae52af0..c7014ab 100644
+--- a/src/parser.c
++++ b/src/parser.c
+@@ -56,6 +56,30 @@
+ #include "extern.h"
+ #include "atofloat.h"
+ 
++/* -Zj: MASM 5 sizing. MASM 5 fixes each instruction's size in pass one,
++ * where a forward reference is assumed to be a near label or a word
++ * variable, and pads the instruction with NOPs in pass two if it turns out
++ * shorter. A forward reference in a displacement keeps its 16-bit size.
++ * The pass one size of each instruction is recorded here, indexed by its
++ * position in the source, and later passes pad up to it.
++ */
++
++static struct {
++    enum instr_token token;
++    uint_8  dispmask;   /* operands with a 16-bit displacement */
++    uint_32 size;
++} *Masm5Sizes;
++static unsigned Masm5Count;
++static unsigned Masm5Max;
++static unsigned Masm5Index;
++bool Masm5FwdRef;              /* expression had a forward reference */
++static uint_8 Masm5OpndFwd;    /* operands with forward references */
++static uint_8 Masm5DispMask;   /* operands with a forced 16-bit displacement */
++
++/* -Zj: instructions of the 80/83 group */
++#define IS_ARITH( t ) ( t == T_ADD || t == T_OR || t == T_ADC || t == T_SBB || \
++                        t == T_AND || t == T_SUB || t == T_XOR || t == T_CMP )
++
+ #define EPCOMMENTS 0 /* 1=add pure comment lines to -EP output */
+ 
+ #define ADDRSIZE( s, x ) ( ( ( x ) ^ ( s ) ) ? TRUE : FALSE )
+@@ -570,6 +594,18 @@ static ret_code set_rm_sib( struct code_info *CodeInfo, unsigned CurrOpnd, char
+     } else {
+         mod_field = MOD_01; /* byte size displacement */
+     }
++    /* -Zj: Masm 5 keeps the 16-bit displacement of a forward reference */
++    if ( Options.masm5_compat && ( index != EMPTY || base != EMPTY ) ) {
++        if ( Parse_Pass == PASS_1 ) {
++            if ( Masm5OpndFwd & ( 1 << CurrOpnd ) )
++                Masm5DispMask |= 1 << CurrOpnd;
++        } else if ( Masm5Index < Masm5Count &&
++                   Masm5Sizes[Masm5Index].token == CodeInfo->token &&
++                   ( Masm5Sizes[Masm5Index].dispmask & ( 1 << CurrOpnd ) ) )
++            Masm5DispMask |= 1 << CurrOpnd;
++        if ( Masm5DispMask & ( 1 << CurrOpnd ) )
++            mod_field = MOD_10;
++    }
+ 
+     if( ( index == EMPTY ) && ( base == EMPTY ) ) {
+         /* direct memory.
+@@ -1993,8 +2029,11 @@ static ret_code process_address( struct code_info *CodeInfo, unsigned CurrOpnd,
+              * a segment register!), scan the
+              * instruction table if the instruction allows an immediate!
+              * If so, assume the undefined symbol is a constant.
++             * -Zj: Masm 5 assumes a memory operand if the first operand
++             * is a register.
+              */
+-            if ( CurrOpnd == OPND2 && (( CodeInfo->opnd[OPND1].type & OP_SR ) == 0 ) ) {
++            if ( CurrOpnd == OPND2 && (( CodeInfo->opnd[OPND1].type & OP_SR ) == 0 ) &&
++                ( Options.masm5_compat == FALSE || ( CodeInfo->opnd[OPND1].type & OP_R ) == 0 ) ) {
+                 const struct instr_item  *p = CodeInfo->pinstr;
+                 do {
+                     if ( opnd_clstab[p->opclsidx].opnd_type[OPND2] & OP_I ) {
+@@ -3012,6 +3051,7 @@ ret_code ParseLine( struct asm_tok tokenarray[] )
+     ret_code            temp;
+     struct asym         *sym;
+     uint_32             oldofs;
++    uint_32             startofs;
+ #ifdef DEBUG_OUT
+     char                *instr;
+ #endif
+@@ -3269,10 +3309,17 @@ ret_code ParseLine( struct asm_tok tokenarray[] )
+             i++;
+         }
+         DebugMsg1(("ParseLine(%s): calling EvalOperand, i=%u\n", instr, i));
++        if ( j == 0 ) {
++            Masm5OpndFwd = 0;
++            Masm5DispMask = 0;
++        }
++        Masm5FwdRef = FALSE;
+         if( EvalOperand( &i, tokenarray, Token_Count, &opndx[j], 0 ) == ERROR ) {
+             DebugMsg(("ParseLine(%s): EvalOperand() failed\n", instr ));
+             return( ERROR );
+         }
++        if ( Masm5FwdRef )
++            Masm5OpndFwd |= 1 << j;
+         switch ( opndx[j].kind ) {
+         case EXPR_FLOAT:
+             /* v2.06: accept float constants for PUSH */
+@@ -3494,6 +3541,20 @@ ret_code ParseLine( struct asm_tok tokenarray[] )
+                            CodeInfo.opnd[OPND2].InsFixup->sym->state == SYM_UNDEFINED )
+                     CodeInfo.opnd[OPND2].type = OP_M;
+             }
++            /* -Zj: Masm 5 assumes a forward referenced variable is a WORD.
++             * The arithmetic instructions get the short form (opcode 83)
++             * then if the immediate fits in a byte. */
++            if ( Options.masm5_compat && Parse_Pass == PASS_1 &&
++                ( CodeInfo.opnd[OPND1].type & OP_M_ANY ) &&
++                ( CodeInfo.opnd[OPND2].type & OP_I ) &&
++                opndx[OPND1].explicit == FALSE && opndx[OPND1].sym &&
++                opndx[OPND1].sym->state == SYM_UNDEFINED &&
++                !( IS_ARITH( CodeInfo.token ) &&
++                  CodeInfo.opnd[OPND2].data32l >= SCHAR_MIN &&
++                  CodeInfo.opnd[OPND2].data32l <= UCHAR_MAX ) ) {
++                CodeInfo.mem_type = MT_WORD;
++                CodeInfo.opnd[OPND1].type = OP_M16;
++            }
+             if( check_size( &CodeInfo, opndx ) == ERROR ) {
+                 DebugMsg(("ParseLine(%s): check_size() failed, exit\n", instr ));
+                 return( ERROR );
+@@ -3541,13 +3602,53 @@ ret_code ParseLine( struct asm_tok tokenarray[] )
+ 
+     /* now call the code generator */
+ 
++    if ( Options.masm5_compat )
++        startofs = GetCurrOffset();
+     if ( ERROR == codegen( &CodeInfo ) )
+         return( ERROR );
++    if ( Options.masm5_compat ) {
++        Masm5Pad( CodeInfo.token, GetCurrOffset() - startofs );
++        CurrSeg->e.seginfo->masm5_code = TRUE;
++    }
+ 
+     LstWrite( LSTTYPE_CODE, oldofs, &CodeInfo );
+     return( NOT_ERROR );
+ }
+ 
++void Masm5PassInit( void )
++/************************/
++{
++    if ( Parse_Pass == PASS_1 )
++        Masm5Count = 0;
++    Masm5Index = 0;
++}
++
++void Masm5Pad( enum instr_token token, uint_32 size )
++/***************************************************/
++{
++    if ( Parse_Pass == PASS_1 ) {
++        if ( Masm5Count == Masm5Max ) {
++            Masm5Max = Masm5Max ? Masm5Max * 2 : 1024;
++            Masm5Sizes = realloc( Masm5Sizes, Masm5Max * sizeof( *Masm5Sizes ) );
++            if ( Masm5Sizes == NULL )
++                Fatal( OUT_OF_MEMORY );
++        }
++        Masm5Sizes[Masm5Count].token = token;
++        Masm5Sizes[Masm5Count].dispmask = Masm5DispMask;
++        Masm5Sizes[Masm5Count].size = size;
++        Masm5Count++;
++        return;
++    }
++    if ( Masm5Index >= Masm5Count || Masm5Sizes[Masm5Index].token != token ) {
++        /* the instruction sequence differs from pass one */
++        Masm5Index = Masm5Count;
++        return;
++    }
++    for ( ; size < Masm5Sizes[Masm5Index].size; size++ )
++        OutputByte( 0x90 );
++    Masm5Index++;
++}
++
+ /* process a file. introduced in v2.11 */
+ 
+ void ProcessFile( struct asm_tok tokenarray[] )
+diff --git a/src/posndir.c b/src/posndir.c
+index db1df11..c30e42b 100644
+--- a/src/posndir.c
++++ b/src/posndir.c
+@@ -139,6 +139,14 @@ static void fill_in_objfile_space( unsigned size )
+      - nops    ... for CODE
+      */
+ 
++    /* -Zj: Masm 5 pads with single byte NOPs if the segment contains
++     * instructions (anywhere, as known after pass one), else with zeros */
++    if ( Options.masm5_compat ) {
++        for ( ; size; size-- )
++            OutputByte( CurrSeg->e.seginfo->masm5_code ? 0x90 : 0x00 );
++        return;
++    }
++
+     /* v2.04: no output if nothing has been written yet */
+     if( CurrSeg->e.seginfo->written == FALSE ) {
+ 

@@ -1,0 +1,97 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+
+# ABSTRACT: Check that a FAT12 floppy image can boot GR-DOS
+
+=head1 SYNOPSIS
+
+ scripts/check-image IMAGE IO.SYS MSDOS.SYS
+
+=head1 DESCRIPTION
+
+Checks the layout the MS-DOS 4.00 boot sector and MSLOAD depend on
+(decision 12):
+
+=over 4
+
+=item *
+
+the boot sector ends with C<55AAh> and its physical drive number (offset
+C<24h>) is C<00h>;
+
+=item *
+
+the first two root directory entries are F<IO.SYS> and F<MSDOS.SYS>, with
+the system attribute, and their contents are the given files;
+
+=item *
+
+F<IO.SYS> starts at the first cluster of the data area and both files
+occupy contiguous clusters, F<MSDOS.SYS> directly after F<IO.SYS>.
+
+=back
+
+Dies with a description of the first problem found.
+
+=cut
+
+sub slurp ($path) {
+  open my $fh, '<:raw', $path or die "unable to read $path: $!";
+  local $/;
+  return scalar <$fh>;
+}
+
+# Cluster $n of a FAT12 table.
+sub fat12 ($fat, $n) {
+  my $word = unpack 'v', substr($fat, int($n * 3 / 2), 2);
+  return $n & 1 ? $word >> 4 : $word & 0xfff;
+}
+
+sub main (@args) {
+  die "usage: $0 IMAGE IO.SYS MSDOS.SYS\n" unless @args == 3;
+  my($path, @expect) = @args;
+  my $img = slurp($path);
+
+  die "$path: no boot signature\n" unless substr($img, 510, 2) eq "\x55\xaa";
+  my $drive = ord substr($img, 0x24, 1);
+  die sprintf "%s: boot drive number is %02Xh, not 00h\n", $path, $drive if $drive;
+
+  my($bps, $spc, $reserved, $nfats, $nroot, undef, undef, $spf)
+    = unpack 'v C v C v v C v', substr($img, 11, 13);
+  die "$path: not a FAT12 floppy BPB\n" unless $bps == 512 && $spc && $nfats && $nroot;
+  my $fat = substr $img, $reserved * $bps, $spf * $bps;
+  my $root_at = ($reserved + $nfats * $spf) * $bps;
+  my $data_at = $root_at + $nroot * 32;
+  my $cluster_bytes = $spc * $bps;
+
+  my $next = 2;
+  for my $i (0, 1) {
+    my $entry = substr $img, $root_at + 32 * $i, 32;
+    my($name, $attr, $start, $size) = unpack 'a11 C x14 v V', $entry;
+    my $want = $i ? 'MSDOS   SYS' : 'IO      SYS';
+    die "$path: root directory entry $i is '$name', not '$want'\n" unless $name eq $want;
+    die "$path: $want has no system attribute\n" unless $attr & 0x04;
+    die "$path: $want starts at cluster $start, not $next\n" unless $start == $next;
+
+    my $clusters = int(($size + $cluster_bytes - 1) / $cluster_bytes);
+    my $c = $start;
+    for my $k (1 .. $clusters) {
+      my $link = fat12($fat, $c);
+      if($k == $clusters) {
+        die "$path: $want does not end after $clusters clusters\n" unless $link >= 0xff8;
+      } else {
+        die "$path: $want is not contiguous at cluster $c\n" unless $link == $c + 1;
+      }
+      $c++;
+    }
+
+    my $data = substr $img, $data_at + ($start - 2) * $cluster_bytes, $size;
+    die "$path: $want differs from $expect[$i]\n" unless $data eq slurp($expect[$i]);
+    $next = $start + $clusters;
+  }
+  return 0;
+}
+
+exit main(@ARGV);

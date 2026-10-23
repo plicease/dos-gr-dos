@@ -1,0 +1,26 @@
+# Lines the smoke test's AUTOEXEC.BAT must write to COM1, in order: one
+# Perl regular expression per line (scripts/smoke-test).
+
+^GRDOS-TEST-BEGIN$
+# VER: GR-DOS branding (decision 7)
+^GR-DOS Version 4\.00$
+# DIR: IO.SYS and MSDOS.SYS are hidden
+^ Volume in drive A has no label$
+^COMMAND  COM +\d+ 
+^AUTOEXEC BAT +\d+ 
+^HELLO    COM +\d+ 
+^ +3 File\(s\) +\d+ bytes free$
+# COPY and TYPE
+^ +1 File\(s\) copied$
+^hello$
+# DEL, MD
+^GRDOS-DEL-OK$
+^GRDOS-MD-OK$
+# the Watcom-built test program, which sees DOS 4.00, and its exit code
+^GRDOS-HELLO DOS 4\.00$
+^GRDOS-ERRORLEVEL-7$
+# a second COMMAND, reading EXIT from a file: its banner, with the Microsoft
+# copyright line (decision 16)
+^GR-DOS Version 4\.00$
+^ +\(C\)Copyright Microsoft Corp 1981-1988$
+^GRDOS-TEST-END$

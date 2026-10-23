@@ -1,0 +1,73 @@
+#!/bin/sh
+#
+# M1 reference build: run the original DOS 4.00 build (NMAKE, MASM, LINK,
+# MS C 5.1 and the other tools in v4.0/src/TOOLS) under DOSBox-X.
+#
+# Local use only (decision 4); not run in CI.
+#
+# usage: scripts/reference-build [OUTDIR]     (default: build/m1)
+
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:-"$root/build/m1"}
+timeout_secs=${M1_TIMEOUT:-3600}
+
+rm -rf "$out"
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
+"$root/scripts/prepare-dos-tree" "$root/v4.0/src" "$out/SRC"
+# Snapshot of the build input, for the manifest of what the build changed.
+pristine="$out/PRISTINE"
+cp -a "$out/SRC" "$pristine"
+
+# Equivalent of SETENV.BAT with the paths corrected to TOOLS\BLD, written
+# here rather than patched into the tree.
+printf '%s\r\n' \
+  '@echo off' \
+  'set CL=' \
+  'set LINK=' \
+  'set MASM=' \
+  'set COUNTRY=usa-ms' \
+  'set LIB=C:\SRC\TOOLS\BLD\LIB' \
+  'set INCLUDE=C:\SRC\TOOLS\BLD\INC' \
+  'set INIT=C:\SRC\TOOLS' \
+  'set PATH=C:\SRC\TOOLS;Z:\' \
+  'cd \SRC' \
+  'nmake -X - >C:\BUILD.LOG' \
+  'if errorlevel 1 goto fail' \
+  'echo OK>C:\STATUS.TXT' \
+  'goto end' \
+  ':fail' \
+  'echo FAILED>C:\STATUS.TXT' \
+  ':end' \
+  > "$out/BUILD.BAT"
+
+dosbox-x -version 2>&1 | head -1 > "$out/dosbox-x.version"
+
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+timeout "$timeout_secs" dosbox-x -silent -nogui -nomenu -defaultconf \
+  -set "cpu cycles=max" \
+  -set "dos ver=5.0" \
+  -set "dos lfn=false" \
+  -c "mount c \"$out\"" \
+  -c "c:" \
+  -c "call BUILD.BAT" \
+  > "$out/dosbox-x.log" 2>&1 || true
+
+status=$(tr -d '\r\n' < "$out/STATUS.TXT" 2>/dev/null || echo MISSING)
+echo "reference build: $status (log: $out/BUILD.LOG)"
+[ "$status" = OK ]
+
+# Manifest of every file the build created or changed, found by comparing
+# contents with the snapshot taken before the build (timestamps are too
+# coarse). MASM listings (.LST) are excluded because their headers contain
+# the build time.
+(
+  cd "$out/SRC"
+  find . -type f ! -iname '*.lst' -printf '%P\n' | LC_ALL=C sort | while IFS= read -r f; do
+    cmp -s "$f" "$pristine/$f" || sha256sum "$f"
+  done
+) > "$out/manifest.sha256"
+rm -rf "$pristine"
+echo "manifest: $(wc -l < "$out/manifest.sha256") files ($out/manifest.sha256)"

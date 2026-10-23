@@ -1,0 +1,21 @@
+#!/bin/sh
+#
+# Rebuild with the original MASM toolchain and confirm every generated file
+# still matches docs/m1/reference-build.sha256 (decision 19: compatibility
+# edits must not change the MASM build). Local use only.
+#
+# usage: scripts/check-reference [OUTDIR]     (default: build/m1-check)
+
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:-"$root/build/m1-check"}
+
+"$root/scripts/reference-build" "$out"
+if cmp -s "$root/docs/m1/reference-build.sha256" "$out/manifest.sha256"; then
+  echo "check-reference: MASM build identical to M1 reference"
+else
+  echo "check-reference: MASM build DIFFERS from M1 reference:" >&2
+  diff "$root/docs/m1/reference-build.sha256" "$out/manifest.sha256" >&2 || true
+  exit 1
+fi

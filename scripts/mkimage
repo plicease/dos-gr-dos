@@ -1,0 +1,57 @@
+#!/bin/sh
+#
+# Build a bootable 1.44 MB GR-DOS floppy image (decisions 5 and 12) from a
+# built tree: the boot sector, IO.SYS, MSDOS.SYS and COMMAND.COM, then any
+# further FILEs into the root directory. Checks the result with
+# scripts/check-image.
+#
+# usage: scripts/mkimage OUT.IMG SRCDIR [FILE...]
+#
+# SOURCE_DATE_EPOCH sets the file times and the volume serial number, so the
+# image is reproducible (default: the time of the last git commit).
+
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+[ $# -ge 2 ] || { echo "usage: $0 OUT.IMG SRCDIR [FILE...]" >&2; exit 2; }
+img=$1
+src=$2
+shift 2
+
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$root" log -1 --format=%ct)}
+# mtools writes directory times in local time.
+TZ=UTC
+export SOURCE_DATE_EPOCH TZ
+serial=$(printf '%08X' "$SOURCE_DATE_EPOCH")
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# MSBOOT.BIN is exe2bin output of a program ORGed at 7C00h; the boot sector
+# is its last 512 bytes (the range DBOF extracts into BOOT.INC).
+tail -c 512 "$src/BOOT/MSBOOT.BIN" > "$tmp/bootsect.bin"
+
+# MSBOOT's default BPB describes a hard disk. mformat rewrites the geometry
+# but not the physical drive number at offset 24h, which the boot code reads,
+# so set it to 00h (first floppy).
+printf '\000' | dd of="$tmp/bootsect.bin" bs=1 seek=36 conv=notrunc status=none
+
+# No volume label: it would take the first directory entry, where the boot
+# sector expects IO.SYS. The image is zero-filled first and formatted in
+# place: mformat -C (mtools 4.0.43) leaves uninitialised memory in the last
+# sector.
+rm -f "$img"
+truncate -s 1474560 "$img"
+mformat -i "$img" -f 1440 -N "$serial" -B "$tmp/bootsect.bin" ::
+
+# IO.SYS and MSDOS.SYS first, so they are the first directory entries and
+# contiguous from the start of the data area.
+for f in "$src/BIOS/IO.SYS" "$src/DOS/MSDOS.SYS" "$src/CMD/COMMAND/COMMAND.COM" "$@"; do
+  name=$(basename "$f" | tr '[:lower:]' '[:upper:]')
+  cp "$f" "$tmp/$name"
+  touch -d "@$SOURCE_DATE_EPOCH" "$tmp/$name"
+  mcopy -m -i "$img" "$tmp/$name" "::$name"
+done
+mattrib -i "$img" +s +h +r ::IO.SYS ::MSDOS.SYS
+
+"$root/scripts/check-image" "$img" "$src/BIOS/IO.SYS" "$src/DOS/MSDOS.SYS"

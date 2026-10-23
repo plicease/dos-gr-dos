@@ -1,0 +1,39 @@
+#!/bin/sh
+#
+# Link 16-bit OMF objects into a DOS executable with Open Watcom wlink,
+# placing the segments where Microsoft LINK 3.x would (decision 19; see
+# scripts/mslink-layout). Writes OUT.EXE, the wlink directives (OUT.WLK;
+# OUT.LNK is often the Microsoft LINK response file) and the map (OUT.MAP).
+# Objects are given in link order.
+#
+# usage: scripts/mslink OUT.EXE OBJ...
+#
+# WATCOM names the Open Watcom tree; the pinned snapshot is fetched if unset.
+
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+[ $# -ge 2 ] || { echo "usage: $0 OUT.EXE OBJ..." >&2; exit 2; }
+out=$1
+shift
+base=${out%.*}
+
+WATCOM=${WATCOM:-$("$root/scripts/fetch-watcom")}
+# wlink finds its system definitions (wlink.lnk) on PATH.
+PATH=$WATCOM/binl64:$PATH
+export WATCOM PATH
+
+{
+  echo "system dos"
+  echo "option quiet"
+  echo "option nocaseexact"
+  echo "option map=$base.MAP"
+  echo "name $out"
+  for obj in "$@"; do
+    echo "file $obj"
+  done
+  "$root/scripts/mslink-layout" "$@"
+} > "$base.WLK"
+
+rm -f "$out"
+wlink @"$base.WLK"

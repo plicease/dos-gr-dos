@@ -1,0 +1,172 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+
+# ABSTRACT: Compute the Microsoft LINK segment layout for wlink
+
+=head1 SYNOPSIS
+
+ scripts/mslink-layout [--size] OBJ...
+
+=head1 DESCRIPTION
+
+Reads the segment definitions of 16-bit OMF object files, given in link
+order, and lays the segments out the way Microsoft LINK 3.x does for a DOS
+executable:
+
+=over 4
+
+=item *
+
+segments are ordered by class, the classes in order of first appearance,
+and within a class in order of first appearance;
+
+=item *
+
+public segments with the same name and class are combined, each
+contribution aligned according to its own segment definition, including
+contributions of length zero;
+
+=item *
+
+the next segment starts at the next address that satisfies its alignment.
+
+=back
+
+wlink (Open Watcom) does not align zero-length contributions, so its layout
+differs whenever a segment ends unaligned and a later module contributes
+nothing to it (the DOS sources declare every segment of their group in every
+module).  This prints a wlink C<ORDER> directive that places every segment
+where Microsoft LINK would have: at the paragraph containing its start
+(C<SEGADDR>, which is also the frame of segment relocations) and the offset
+within that paragraph.  The linked image is then byte-identical.  Absolute
+(C<AT>) segments are not part of the image and are left out.
+
+With C<--size>, prints the image size in bytes instead: the end of the last
+segment that is not empty, after the alignment of its last contribution.  Microsoft
+LINK writes the image up to that point, including trailing uninitialised
+data that MASM had written as zeros, so a linked image shorter than this is
+padded with zeros to match.
+
+=cut
+
+my %align_bytes = ( 1 => 1, 2 => 2, 3 => 16, 4 => 256, 5 => 4 );
+
+sub index_field ($data, $pos) {
+  my $b = ord substr($$data, $$pos++, 1);
+  return $b unless $b & 0x80;
+  return (($b & 0x7f) << 8) | ord substr($$data, $$pos++, 1);
+}
+
+# Segment definitions of one object file, in order.
+sub segdefs ($path) {
+  open my $fh, '<:raw', $path or die "unable to read $path: $!";
+  local $/;
+  my $obj = <$fh>;
+
+  my(@lnames, @segs);
+  my $pos = 0;
+  while($pos < length $obj) {
+    my($type, $len) = unpack 'C v', substr($obj, $pos, 3);
+    my $rec = substr($obj, $pos + 3, $len - 1);
+    $pos += 3 + $len;
+    my $p = 0;
+    if($type == 0x96) {
+      while($p < length $rec) {
+        my $n = ord substr($rec, $p++, 1);
+        push @lnames, substr($rec, $p, $n);
+        $p += $n;
+      }
+    } elsif($type == 0x98) {
+      my $acbp = ord substr($rec, $p++, 1);
+      my $align = $acbp >> 5;
+      $p += 3 if $align == 0;
+      my $size = unpack 'v', substr($rec, $p, 2);
+      $p += 2;
+      $size = 0x10000 if $acbp & 0x02;
+      my $name  = $lnames[index_field(\$rec, \$p) - 1];
+      my $class = $lnames[index_field(\$rec, \$p) - 1];
+      push @segs, {
+        name    => uc $name,
+        class   => uc $class,
+        align   => $align,
+        combine => ($acbp >> 2) & 7,
+        size    => $size,
+      };
+    } elsif($type == 0x99) {
+      die "$path: 32-bit segment definitions are not supported\n";
+    }
+  }
+  return @segs;
+}
+
+sub align_up ($addr, $align) {
+  return $addr if $align <= 1;
+  return int(($addr + $align - 1) / $align) * $align;
+}
+
+# Lay out the segments; returns the combined segments in image order with
+# their start offsets and lengths.
+sub layout (@objs) {
+  my(@classes, %by_class, %combined);
+  for my $obj (@objs) {
+    for my $seg (segdefs($obj)) {
+      next if $seg->{align} == 0;   # absolute (AT) segment
+      my $public = $seg->{combine} != 0;
+      my $key = "$seg->{name}\0$seg->{class}";
+      my $target = $public ? $combined{$key} : undef;
+      unless($target) {
+        push @classes, $seg->{class} unless $by_class{$seg->{class}};
+        $target = { name => $seg->{name}, class => $seg->{class}, parts => [] };
+        push $by_class{$seg->{class}}->@*, $target;
+        $combined{$key} = $target if $public;
+      }
+      push $target->{parts}->@*, $seg;
+    }
+  }
+
+  my @image;
+  my $addr = 0;
+  for my $class (@classes) {
+    for my $seg ($by_class{$class}->@*) {
+      my $start = align_up($addr, $align_bytes{$seg->{parts}[0]{align}} // 1);
+      my $cur = $start;
+      for my $part ($seg->{parts}->@*) {
+        $cur = align_up($cur, $align_bytes{$part->{align}} // 1);
+        $cur += $part->{size};
+      }
+      my $length = $cur - $start;
+      push @image, { $seg->%*, start => $start, length => $length };
+      $addr = $start + $length;
+    }
+  }
+  return @image;
+}
+
+sub main (@args) {
+  my $size = @args && $args[0] eq '--size' ? shift @args : 0;
+  die "usage: $0 [--size] OBJ...\n" unless @args;
+  my @image = layout(@args);
+  if($size) {
+    my $end = 0;
+    for my $seg (@image) {
+      $end = $seg->{start} + $seg->{length} if $seg->{length};
+    }
+    say $end;
+    return 0;
+  }
+  my @order;
+  my $class;
+  for my $seg (@image) {
+    push @order, "clname" . (length $seg->{class} ? " '$seg->{class}'" : '')
+      unless defined $class && $class eq $seg->{class};
+    $class = $seg->{class};
+    push @order, sprintf "segment '%s' segaddr=0x%04X offset=0x%X",
+      $seg->{name}, $seg->{start} >> 4, $seg->{start} & 15;
+  }
+  say "order ", join " ", @order;
+  return 0;
+}
+
+exit main(@ARGV);

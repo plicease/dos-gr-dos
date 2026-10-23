@@ -1,0 +1,274 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+use File::Basename qw( fileparse );
+
+# ABSTRACT: Build message source files from a skeleton and a message file
+
+=head1 SYNOPSIS
+
+ scripts/buildmsg [--nosrvbld] MSGFILE SKELETON
+
+=head1 DESCRIPTION
+
+Replacement for the C<BUILDMSG> and C<NOSRVBLD> tools of the MS-DOS 4.00
+build.  Reads the message skeleton C<SKELETON> (F<NAME.SKL>) and the
+message file C<MSGFILE> (F<MESSAGES/USA-MS.MSG>) and writes, next to the
+skeleton, one assembler include file F<NAME.CLx> for every C<:class x> in
+the skeleton.
+
+Without C<--nosrvbld>, the output is the input of the message retriever
+(C<SYSMSG.INC>), as C<BUILDMSG> writes it: a class structure with the
+message numbers and texts of the class, and a procedure that returns it.
+C<NAME.CTL> gives the number of classes other than 1 and 2.
+
+With C<--nosrvbld>, as C<NOSRVBLD> writes it, every message is a labelled
+C<DB> statement.  This is used where the message retriever is not, by the
+boot sector, IO.SYS and MSDOS.SYS.
+
+=head2 Message file
+
+The first line holds a revision counter.  A component starts with a line
+C<NAME offset count>; each message is a line C<NNNN U NNNN text>, where
+C<text> is the operand of a C<DB> statement and continues on lines that
+begin with a tab.
+
+=head2 Skeleton
+
+Lines that do not begin with C<:> are comments.  Directives, which are not
+case sensitive:
+
+=over 4
+
+=item C<:util NAME>
+
+the component of the messages that C<:def> refers to (C<BUILDMSG>).
+C<NOSRVBLD> uses the name of the skeleton file;
+
+=item C<:class x>
+
+starts the class C<x> (1-9, A-F);
+
+=item C<:use [NUMBER] COMPONENTnumber>
+
+the message C<number> of C<COMPONENT>, as message C<NUMBER> (default:
+C<number>; -1 is 0FFFFh).  C<EXTEND999> and C<PARSE999> are the generic
+"Extended Error %1" and "Parse Error %1".  An C<EXTEND> or C<PARSE> message
+given a C<NUMBER> is followed by CR,LF.  A message missing from the
+message file is empty (C<BUILDMSG>);
+
+=item C<:use NUMBER COMPONENT LABEL>
+
+the message C<NUMBER> of C<COMPONENT> labelled C<LABEL> (C<NOSRVBLD>);
+
+=item C<:def NUMBER [LABEL]>
+
+the message C<NUMBER> of the skeleton's own component, labelled C<LABEL>
+for C<NOSRVBLD>.  The text that follows in the skeleton is ignored: it is
+taken from the message file;
+
+=item C<:end>
+
+ends the skeleton.
+
+=back
+
+=cut
+
+my %generic = (
+  EXTEND999 => [ '"Extended Error %1"' ],
+  PARSE999  => [ '"Parse Error %1"' ],
+);
+
+sub read_lines ($path) {
+  open my $fh, '<:raw', $path or die "unable to read $path: $!";
+  my $text = do { local $/; <$fh> };
+  close $fh;
+  $text =~ s/\x1a.*//s;
+  return split /\r?\n/, $text;
+}
+
+# Messages of the message file: { COMPONENT => { number => [lines] } }.
+sub read_messages ($path) {
+  my(%msg, $comp, $lines);
+  my @lines = read_lines($path);
+  shift @lines;
+  for my $line (@lines) {
+    if($line =~ /^(\S+)\s+[0-9a-f]{4}\s+[0-9a-f]{4}\s*$/i) {
+      $comp = $msg{uc $1} //= {};
+    } elsif($line =~ /^(\d{4}) \S \d{4} (.*)$/) {
+      die "$path: message outside a component: $line\n" unless $comp;
+      $lines = $comp->{$1 + 0} = [ $2 ];
+    } elsif($line =~ /^\t/ && $lines) {
+      push @$lines, $line;
+    } elsif($line =~ /\S/) {
+      die "$path: unrecognised line: $line\n";
+    }
+  }
+  return \%msg;
+}
+
+sub message ($msg, $comp, $number, $missing_ok = 0) {
+  my $text = $msg->{uc $comp}{$number + 0};
+  return $text if $text;
+  die "message $number of component $comp not found\n" unless $missing_ok;
+  warn "warning: message $number of component $comp not found\n";
+  return [];
+}
+
+# Classes of the skeleton: [ { name => 'x', messages => [ { ... } ] } ].
+sub read_skeleton ($path, $msg, $nosrv) {
+  my $util = $nosrv ? uc((fileparse($path, qr/\.[^.]*/))[0]) : undef;
+  my(@classes, $class);
+  for my $line (read_lines($path)) {
+    next unless $line =~ /^:(\w+)\s*([^;]*)/;
+    my($dir, @args) = (lc $1, split ' ', $2);
+    if($dir eq 'end') {
+      last;
+    } elsif($dir eq 'util') {
+      $util = uc $args[0] unless $nosrv;
+    } elsif($dir eq 'class') {
+      push @classes, $class = { name => uc $args[0], messages => [] };
+    } elsif($dir eq 'use' || $dir eq 'def') {
+      die "$path: $line: outside a class\n" unless $class;
+      my %m;
+      if($dir eq 'def') {
+        die "$path: $line: no :util\n" unless defined $util;
+        $m{number} = $args[0];
+        $m{label} = $args[1] if $nosrv;
+        $m{text} = message($msg, $util, $args[0], !$nosrv);
+      } elsif($nosrv) {
+        @m{qw( number label )} = @args[0, 2];
+        $m{text} = message($msg, $args[1], $args[0]);
+      } else {
+        my $ref = uc pop @args;
+        my($comp, $n) = $ref =~ /^(\D+)(\d+)$/ or die "$path: $line: bad message\n";
+        $m{number} = @args ? $args[0] : $n;
+        my @text = ($generic{$ref} // message($msg, $comp, $n, 1))->@*;
+        $text[-1] .= ",CR,LF" if @args && @text && $comp =~ /^(EXTEND|PARSE)$/;
+        $m{text} = \@text;
+      }
+      die "$path: $line: label missing\n" if $nosrv && !defined $m{label};
+      push $class->{messages}->@*, \%m;
+    } else {
+      die "$path: $line: unknown directive\n";
+    }
+  }
+  return @classes;
+}
+
+sub nosrvbld ($name, $class) {
+  my $out = sprintf "; %s.cl%s \r\n\r\n", lc $name, lc $class->{name};
+  for my $m ($class->{messages}->@*) {
+    my($first, @rest) = $m->{text}->@*;
+    $out .= "\r\n;_______________________\r\n\r\n";
+    $out .= "$m->{label} DB    $first\r\n";
+    $out .= "\tDB   $_\r\n" for @rest;
+  }
+  return $out;
+}
+
+sub buildmsg ($class, $proc) {
+  my $c = $class->{name};
+  my $sep = "; " . ('-' x 58) . "\r\n\r\n";
+  my $system = $c eq '1' || $c eq '2';
+  my @msgs = map {
+    my $n = $_->{number} == -1 ? 0xffff : $_->{number};
+    { id => sprintf("%05XH", $n), text => $_->{text} };
+  } $class->{messages}->@*;
+  my $id = $system ? "00${c}H" : '0FFH';
+  my $count = @msgs + ($system ? 1 : 0);
+
+  my $out = "\r\n$sep";
+  $out .= "        PUBLIC  $proc\r\n";
+  $out .= "        IF1\r\n";
+  $out .= "        %out    ... Including message Class $c\r\n";
+  $out .= "        ENDIF\r\n\r\n";
+  $out .= $sep;
+  $out .= "\$M_CLASS_${c}_STRUC LABEL BYTE\r\n";
+  $out .= "        \$M_CLASS_ID <$id,EXPECTED_VERSION,Class_${c}_MessageCount>\r\n\r\n";
+  $out .= "$sep\r\n";
+  for my $m (@msgs) {
+    my $l = "\$M_${c}_$m->{id}";
+    $out .= "${l}_STRUC LABEL BYTE\r\n";
+    $out .= "        \$M_ID   <$m->{id},${l}_MSG-${l}_STRUC>\r\n\r\n";
+  }
+  if($system) {
+    $out .= $sep;
+    $out .= "\$M_${c}_FF_STRUC LABEL BYTE\r\n";
+    $out .= "        \$M_ID <0FFFFH,\$M_${c}_FF_MSG-\$M_${c}_FF_STRUC>\r\n\r\n";
+  }
+  $out .= "$sep\r\n";
+  my @texts = map { [ "\$M_${c}_$_->{id}", $_->{text} ] } @msgs;
+  for my $t (@texts) {
+    my($l, $text) = @$t;
+    $out .= "${l}_MSG LABEL BYTE\r\n";
+    $out .= "        DB      ${l}_END-${l}_MSG-1\r\n";
+    $out .= "        DB      $_\r\n" for @$text;
+    $out .= "${l}_END LABEL BYTE\r\n  \r\n";
+  }
+  if($system) {
+    my $l = "\$M_${c}_FF";
+    my $text = $generic{$c eq '1' ? 'EXTEND999' : 'PARSE999'}[0];
+    $out .= $sep;
+    $out .= "${l}_MSG LABEL BYTE\r\n";
+    $out .= "        DB      ${l}_END-${l}_MSG-1\r\n";
+    $out .= "        DB      $text\r\n";
+    $out .= "${l}_END LABEL BYTE\r\n  \r\n";
+  }
+  $out .= $sep;
+  $out .= "Class_${c}_MessageCount EQU     $count\r\n\r\n";
+  $out .= $sep;
+  $out .= "        IF      FARmsg\r\n";
+  $out .= "$proc PROC FAR\r\n";
+  $out .= "        ELSE\r\n";
+  $out .= "$proc PROC NEAR\r\n";
+  $out .= "        ENDIF\r\n\r\n";
+  $out .= "        PUSH    CS\r\n";
+  $out .= "        POP     ES\r\n";
+  $out .= "        LEA     DI,\$M_CLASS_${c}_STRUC\r\n";
+  $out .= "        ADD     CX,\$-\$M_CLASS_${c}_STRUC\r\n";
+  $out .= "        RET\r\n\r\n";
+  $out .= "$proc " . ($system ? 'Endp' : 'ENDP') . "\r\n\r\n";
+  $out .= $sep;
+  return $out;
+}
+
+sub write_file ($path, $content) {
+  open my $fh, '>:raw', $path or die "unable to write $path: $!";
+  print $fh $content;
+  close $fh or die "unable to write $path: $!";
+}
+
+sub main (@args) {
+  my $nosrv = @args && $args[0] eq '--nosrvbld' ? shift @args : 0;
+  die "usage: $0 [--nosrvbld] MSGFILE SKELETON\n" unless @args == 2;
+  my($msgfile, $skl) = @args;
+  my($name, $dir) = fileparse($skl, qr/\.[^.]*/);
+  my $base = $dir . uc $name;
+
+  my @classes = read_skeleton($skl, read_messages($msgfile), $nosrv);
+  unless($nosrv) {
+    # The message retriever needs the system classes 1 and 2.
+    for my $c (qw( 1 2 )) {
+      push @classes, { name => $c, messages => [] } unless grep { $_->{name} eq $c } @classes;
+    }
+  }
+  my $cls = 0;
+  for my $class (@classes) {
+    my $content;
+    if($nosrv) {
+      $content = nosrvbld($name, $class);
+    } elsif($class->{name} eq '1' || $class->{name} eq '2') {
+      $content = buildmsg($class, "\$M_MSGSERV_$class->{name}");
+    } else {
+      $content = buildmsg($class, '$M_CLS_' . ++$cls);
+    }
+    write_file("$base.CL$class->{name}", $content);
+  }
+  write_file("$base.CTL", "\$M_NUM_CLS  EQU $cls\r\n") unless $nosrv;
+  return 0;
+}
+
+exit main(@ARGV);

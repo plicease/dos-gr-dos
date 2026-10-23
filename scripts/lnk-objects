@@ -1,0 +1,81 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+use File::Spec ();
+
+# ABSTRACT: List the object files of a Microsoft LINK response file
+
+=head1 SYNOPSIS
+
+ scripts/lnk-objects ROOT DIR/NAME.LNK
+
+=head1 DESCRIPTION
+
+Reads the Microsoft LINK response file F<DIR/NAME.LNK> in the source tree
+C<ROOT> and prints the object files it links, one per line and in link
+order, as paths relative to C<ROOT>.
+
+The object list is the first field of the response file: it ends at the
+first comma, or at the first line that does not end with C<+>.  Objects are
+separated by C<+> or white space; options (C</MAP>) are ignored.  Object
+names are relative to F<DIR>, use C<\> as the directory separator and may
+omit the C<.OBJ> extension.  Directories are matched against C<ROOT>
+without regard to case, and the file name is printed in upper case, so that
+every object has one spelling.
+
+=cut
+
+# The name of the entry of directory $dir that matches $name in any case.
+sub find_entry ($dir, $name) {
+  return $name if $name eq '..' || $name eq '.';
+  opendir my $dh, $dir or die "unable to read $dir: $!";
+  my($found) = grep { lc $_ eq lc $name } readdir $dh;
+  closedir $dh;
+  die "$dir/$name: not found\n" unless defined $found;
+  return $found;
+}
+
+sub objects ($root, $lnk) {
+  open my $fh, '<:raw', "$root/$lnk" or die "unable to read $root/$lnk: $!";
+  my $text = do { local $/; <$fh> };
+  close $fh;
+  $text =~ s/\x1a.*//s;
+
+  my $list = '';
+  for my $line (split /\r?\n/, $text) {
+    if($line =~ /^([^,]*),/) {
+      $list .= " $1";
+      last;
+    }
+    $list .= " $line";
+    last unless $line =~ /\+\s*$/;
+  }
+
+  my(undef, $dir) = File::Spec->splitpath($lnk);
+  my @objs;
+  for my $obj (grep { length && !m{^/} } split /[\s+]+/, $list) {
+    $obj =~ s{\\}{/}g;
+    $obj .= '.obj' unless $obj =~ m{\.[^./]*$};
+    my @path = grep { length } split m{/}, "$dir/$obj";
+    my $file = uc pop @path;
+    my @resolved;
+    for my $part (@path) {
+      if($part eq '..') {
+        pop @resolved;
+      } elsif($part ne '.') {
+        push @resolved, find_entry(join('/', $root, @resolved), $part);
+      }
+    }
+    push @objs, join '/', @resolved, $file;
+  }
+  return @objs;
+}
+
+sub main (@args) {
+  die "usage: $0 ROOT DIR/NAME.LNK\n" unless @args == 2;
+  say for objects(@args);
+  return 0;
+}
+
+exit main(@ARGV);

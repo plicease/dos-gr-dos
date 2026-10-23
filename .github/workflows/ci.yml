@@ -1,0 +1,109 @@
+# Build and verify GR-DOS, and boot it in QEMU (decisions 13, 17 and 18).
+# The job `ci` is the required status check on main. When a push to main
+# carries a VERSION with no release yet, `release` tags that commit
+# v<VERSION> and publishes the CI artifacts as a GitHub Release.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: shogo82148/actions-setup-perl@a99edab616eaa8a66bbc16363c77a83361e5f2ce # v1.44.3
+        with:
+          perl-version: 5.42.3
+          enable-modules-cache: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/tools
+          key: tools-ubuntu-24.04-${{ hashFiles('scripts/fetch-jwasm', 'scripts/fetch-watcom', 'patches/jwasm/*.patch') }}
+
+      - name: Install mtools and QEMU
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends mtools qemu-system-x86
+
+      - name: Fetch tools
+        run: |
+          scripts/fetch-jwasm
+          scripts/fetch-watcom
+
+      - name: Build, and compare an unbranded build with the M1 reference
+        run: |
+          mkdir -p build
+          make -j"$(nproc)" all check 2>&1 | tee build/make.log
+
+      - name: Boot smoke test in QEMU
+        run: make test 2>&1 | tee build/test.log
+
+      - name: Collect artifacts
+        run: |
+          make dist
+          cp build/make.log build/test.log build/linux/dist/
+          {
+            echo "runner $ImageOS $ImageVersion"
+            uname -srm
+            head -1 build/linux/tests/smoke/qemu.version
+            mformat --version | head -1
+          } >> build/linux/dist/BUILDINFO
+          cat build/linux/dist/BUILDINFO
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gr-dos
+          path: build/linux/dist/
+          if-no-files-found: error
+
+  release:
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check for an unreleased version
+        id: version
+        run: |
+          version=$(cat VERSION)
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null; then
+            echo "v$version is already tagged"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.version.outputs.new == 'true'
+        with:
+          name: gr-dos
+          path: dist
+
+      - name: Tag and release
+        if: steps.version.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "GR-DOS ${TAG#v}" \
+            --notes "Built by CI from $GITHUB_SHA. See BUILDINFO for tool versions and SHA256SUMS for checksums."

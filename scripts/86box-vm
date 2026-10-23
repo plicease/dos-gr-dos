@@ -1,0 +1,59 @@
+#!/bin/sh
+#
+# Set up an 86Box VM that boots a GR-DOS floppy image on an 8088-class
+# machine, for the manual 8086/V20 check (decision 9). Writes VMDIR/86box.cfg
+# and copies the image to VMDIR/gr-dos.img, so DOS never writes to the
+# build output.
+#
+# usage: scripts/86box-vm [--cpu necv20|8088] VMDIR [IMAGE]
+#
+# The machine is the Xi 8088 (an 8088 board with an AT-style 1.44 MB floppy
+# controller; XT controllers cannot read 1.44 MB disks). The CPU defaults
+# to the NEC V20, at 4.77 MHz. Run it with:
+#
+#   86Box -R ROMDIR -P VMDIR
+
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+cpu=necv20
+if [ "${1:-}" = --cpu ]; then
+  cpu=${2:?}
+  shift 2
+fi
+case $cpu in
+  necv20|8088) ;;
+  *) echo "$0: --cpu must be necv20 or 8088" >&2; exit 2 ;;
+esac
+[ $# -ge 1 ] && [ $# -le 2 ] || { echo "usage: $0 [--cpu necv20|8088] VMDIR [IMAGE]" >&2; exit 2; }
+image=${2:-$root/build/linux/gr-dos.img}
+
+mkdir -p "$1"
+vm=$(cd "$1" && pwd)
+cp "$image" "$vm/gr-dos.img"
+
+# 86Box replaces a config it cannot use with its defaults (an IBM PC with
+# ROM BASIC), so the image path is absolute.
+cat > "$vm/86box.cfg" <<EOF
+[Machine]
+machine = xi8088
+cpu_family = $cpu
+cpu_speed = 4772728
+cpu_multi = 1
+cpu_use_dynarec = 0
+mem_size = 640
+
+[Video]
+gfxcard = cga
+
+[Input devices]
+keyboard_type = keyboard_at
+mouse_type = none
+
+[Floppy and CD-ROM drives]
+fdd_01_type = 35_2hd
+fdd_01_fn = $vm/gr-dos.img
+fdd_02_type = none
+EOF
+
+echo "$vm"

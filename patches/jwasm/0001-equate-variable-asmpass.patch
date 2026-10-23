@@ -1,0 +1,23 @@
+JWasm: an assembly-time variable (=) is met in the current pass
+
+CreateAssemblyTimeVariable() did not set asmpass, so in pass two
+process_branch() took a variable holding a label address (ret_l = x1)
+for a label not yet defined in this pass and used the current offset:
+"jc ret_l" became a jump to itself.  EQU sets asmpass already.
+
+Needed for the condret macros (retc, retz, ...) in DOSMAC.INC.
+
+diff --git a/src/equate.c b/src/equate.c
+index 3d7d03d..7925ccb 100644
+--- a/src/equate.c
++++ b/src/equate.c
+@@ -240,6 +240,9 @@ static struct asym *CreateAssemblyTimeVariable( struct asm_tok tokenarray[] )
+ #endif
+     }
+     sym->isvariable = TRUE;
++    /* the variable has been met in this pass; process_branch() relies on
++     * this to tell a label alias from a label not yet defined in this pass */
++    sym->asmpass = Parse_Pass;
+ #ifdef DEBUG_OUT
+     if ( Parse_Pass > PASS_1 ) {
+         if ( opnd.kind == EXPR_CONST && sym->uvalue != opnd.uvalue )

@@ -1,0 +1,27 @@
+GR-DOS branding (decision 7): COMMAND's startup banner and the VER output
+say GR-DOS. The version programs see is unchanged (4.00), and the banner
+keeps the Microsoft copyright line (decision 16).
+
+Applied to a copy of v4.0/src before it is converted to CRLF (Makefile,
+PATCHES). `make check` builds without it.
+
+--- a/MESSAGES/USA-MS.MSG
++++ b/MESSAGES/USA-MS.MSG
+@@ -172,7 +172,7 @@
+ 0234 U 0000 CR,LF,"Top level process aborted, cannot continue",CR,LF
+ 0235 U 0000 CR,LF
+ 0463 U 0000 "Out of environment space",CR,LF
+-0464 U 0001 CR,LF,CR,LF,"Microsoft(R) MS-DOS(R) Version 4.00",CR,LF
++0464 U 0001 CR,LF,CR,LF,"GR-DOS Version 4.00",CR,LF
+ 	"             (C)Copyright Microsoft Corp 1981-1988",CR,LF
+ 0465 U 0000 "Specified COMMAND search directory bad",CR,LF
+ 0466 U 0000 "Specified COMMAND search directory bad access denied",CR,LF
+@@ -202,7 +202,7 @@
+ 1038 U 0000 ",    Delete (Y/N)?"
+ 1039 U 0000 "All files in directory will be deleted!",CR,LF
+ 	"Are you sure (Y/N)?"
+-1040 U 0000 "MS-DOS Version %1.%2"
++1040 U 0000 "GR-DOS Version %1.%2"
+ 1044 U 0000 "Invalid directory",CR,LF
+ 1046 U 0000 "Invalid path, not directory,",CR,LF,"or directory not empty",CR,LF
+ 1047 U 0000 "Must specify ON or OFF",CR,LF

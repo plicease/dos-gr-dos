@@ -1,0 +1,95 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+use File::Find ();
+use File::Path qw( make_path );
+use File::Spec ();
+
+# ABSTRACT: Copy the vendored source tree into a form the DOS-hosted tools accept
+
+=head1 SYNOPSIS
+
+ scripts/prepare-dos-tree v4.0/src build/m1/src
+
+=head1 DESCRIPTION
+
+Copies the source tree in the first argument to the second, which must not
+exist.  Upstream ships text files with LF line endings, but the original DOS
+tools expect CRLF, so text files are converted:
+
+=over 4
+
+=item *
+
+Line endings become CRLF.
+
+=item *
+
+C<^Z> is stripped from C<.SKL> message skeletons, which C<NOSRVBLD> rejects.
+
+=back
+
+A file is treated as binary, and copied unchanged, if its extension is one of
+C<EXE COM OBJ LIB SYS CPI> or it contains a NUL byte.  The transformation is
+deterministic, and the vendored tree is never modified.
+
+=cut
+
+my %binary_ext = map { $_ => 1 } qw( EXE COM OBJ LIB SYS CPI );
+
+sub is_binary ($path, $data) {
+  my($ext) = $path =~ /\.([^.\/]+)\z/;
+  return 1 if defined $ext && $binary_ext{uc $ext};
+  return $data =~ /\0/;
+}
+
+sub to_dos ($path, $data) {
+  $data =~ s/\r?\n/\r\n/g;
+  $data =~ s/\x1a//g if $path =~ /\.SKL\z/i;
+  return $data;
+}
+
+sub slurp ($path) {
+  open my $fh, '<:raw', $path or die "unable to read $path: $!";
+  local $/;
+  return scalar <$fh>;
+}
+
+sub spew ($path, $data) {
+  open my $fh, '>:raw', $path or die "unable to write $path: $!";
+  print $fh $data;
+  close $fh or die "unable to write $path: $!";
+}
+
+sub main ($src, $dst) {
+  die "source $src is not a directory\n" unless -d $src;
+  die "destination $dst already exists\n" if -e $dst;
+
+  my %count = ( text => 0, binary => 0 );
+
+  File::Find::find({
+    no_chdir => 1,
+    wanted   => sub {
+      my $rel = File::Spec->abs2rel($File::Find::name, $src);
+      my $out = File::Spec->catfile($dst, $rel);
+      if(-d $File::Find::name) {
+        make_path($out);
+        return;
+      }
+      my $data = slurp($File::Find::name);
+      if(is_binary($rel, $data)) {
+        $count{binary}++;
+      } else {
+        $data = to_dos($rel, $data);
+        $count{text}++;
+      }
+      spew($out, $data);
+    },
+  }, $src);
+
+  say "prepared $dst: $count{text} text, $count{binary} binary";
+}
+
+die "usage: $0 SRC DST\n" unless @ARGV == 2;
+main(@ARGV);

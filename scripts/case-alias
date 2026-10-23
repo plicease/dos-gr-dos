@@ -1,0 +1,80 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+use File::Find ();
+use File::Spec ();
+
+# ABSTRACT: Add case-variant symlinks so DOS-style file references resolve on Linux
+
+=head1 SYNOPSIS
+
+ scripts/case-alias build/m2/SRC
+
+=head1 DESCRIPTION
+
+DOS file names are case-insensitive, and the DOS 4 sources refer to the same
+file as C<DOSSYM.INC>, C<dossym.inc> and C<Dossym.inc>.  Linux tools need the
+exact spelling, so for every file in the tree this adds symlinks, in the same
+directory, for:
+
+=over 4
+
+=item *
+
+the all-lowercase and all-uppercase spellings of its name, and
+
+=item *
+
+every other spelling of its name that appears as a C<NAME.EXT> token in any
+text file in the tree (for example in C<include> lines or macro arguments).
+
+=back
+
+Existing files are never replaced.  The script is idempotent; run it again
+after generating files whose names are referenced elsewhere.
+
+=cut
+
+sub slurp ($path) {
+  open my $fh, '<:raw', $path or die "unable to read $path: $!";
+  local $/;
+  return scalar <$fh>;
+}
+
+sub main ($root) {
+  die "usage: $0 DIR\n" unless defined $root && -d $root;
+
+  my %dirs;       # dir => [ real file names ]
+  my %spellings;  # lc name => { spelling => 1 }
+
+  File::Find::find({
+    no_chdir => 1,
+    wanted   => sub {
+      return if -l $File::Find::name || !-f _;
+      my($vol, $dir, $name) = File::Spec->splitpath($File::Find::name);
+      push $dirs{$dir}->@*, $name;
+      my $data = slurp($File::Find::name);
+      return if $data =~ /\0/;
+      $spellings{lc $1}{$1} = 1 while $data =~ /([A-Za-z0-9_\$\-]{1,8}\.[A-Za-z0-9_\$]{1,3})(?![A-Za-z0-9_\$])/g;
+    },
+  }, $root);
+
+  my $count = 0;
+  for my $dir (sort keys %dirs) {
+    for my $name (sort $dirs{$dir}->@*) {
+      my %alias = map { $_ => 1 } lc $name, uc $name, keys(($spellings{lc $name} // {})->%*);
+      for my $alias (sort keys %alias) {
+        next if $alias eq $name;
+        my $path = File::Spec->catfile($dir, $alias);
+        next if -e $path || -l $path;
+        symlink $name, $path or die "unable to symlink $path: $!";
+        $count++;
+      }
+    }
+  }
+
+  say "case-alias $root: $count symlinks";
+}
+
+main(@ARGV);

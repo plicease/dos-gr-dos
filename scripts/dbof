@@ -1,0 +1,40 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+
+# ABSTRACT: Write part of a binary file as assembler DB statements
+
+=head1 SYNOPSIS
+
+ scripts/dbof IN.BIN OUT.INC OFFSET LENGTH
+
+=head1 DESCRIPTION
+
+Replacement for the C<DBOF> tool of the MS-DOS 4.00 build.  Writes
+C<LENGTH> bytes of C<IN.BIN>, starting at C<OFFSET> (both hexadecimal), to
+C<OUT.INC> as C<DB> statements of eight bytes each.  The build uses it to
+include the boot sector in FORMAT and SYS (F<INC/BOOT.INC>) and the master
+boot record in FDISK.
+
+=cut
+
+sub main (@args) {
+  die "usage: $0 IN.BIN OUT.INC OFFSET LENGTH\n" unless @args == 4;
+  my($in, $out, $offset, $length) = ($args[0], $args[1], hex $args[2], hex $args[3]);
+
+  open my $fh, '<:raw', $in or die "unable to read $in: $!";
+  my $data = do { local $/; <$fh> };
+  close $fh;
+  die "$in: shorter than ", $offset + $length, " bytes\n" if length $data < $offset + $length;
+
+  my @bytes = unpack 'C*', substr $data, $offset, $length;
+  open $fh, '>:raw', $out or die "unable to write $out: $!";
+  while(my @line = splice @bytes, 0, 8) {
+    print $fh "\tdb\t", join(',', map { sprintf '%03XH', $_ } @line), "\r\n";
+  }
+  close $fh or die "unable to write $out: $!";
+  return 0;
+}
+
+exit main(@ARGV);

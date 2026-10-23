@@ -1,0 +1,64 @@
+#!/bin/sh
+#
+# M1 boot smoke test: put the reference build's boot sector, IO.SYS,
+# MSDOS.SYS and COMMAND.COM on a 1.44 MB floppy image and boot it in
+# headless QEMU. AUTOEXEC.BAT reports to COM1, which QEMU writes to a file.
+#
+# usage: scripts/reference-boot [BUILDDIR]     (default: build/m1)
+
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+build=${1:-"$root/build/m1"}
+src="$build/SRC"
+out="$build/boot"
+timeout_secs=${M1_BOOT_TIMEOUT:-60}
+
+rm -rf "$out"
+mkdir -p "$out"
+img="$out/floppy.img"
+
+# MSBOOT.BIN is exe2bin output of a program ORGed at 7C00h; the boot sector
+# is its last 512 bytes (the same range DBOF extracts into BOOT.INC).
+tail -c 512 "$src/BOOT/MSBOOT.BIN" > "$out/bootsect.bin"
+
+# MSBOOT's default BPB describes a hard disk. mformat rewrites the geometry
+# but not the physical drive number at offset 24h, which the boot code reads
+# from, so set it to 00h (first floppy).
+printf '\000' | dd of="$out/bootsect.bin" bs=1 seek=36 conv=notrunc status=none
+
+# Fresh image with our boot code; mformat fills in the floppy geometry.
+mformat -i "$img" -C -f 1440 -B "$out/bootsect.bin" ::
+
+# IO.SYS and MSDOS.SYS first, so they are the first directory entries and
+# contiguous from the start of the data area.
+mcopy -i "$img" "$src/BIOS/IO.SYS" ::IO.SYS
+mcopy -i "$img" "$src/DOS/MSDOS.SYS" ::MSDOS.SYS
+mattrib -i "$img" +s +h +r ::IO.SYS ::MSDOS.SYS
+mcopy -i "$img" "$src/CMD/COMMAND/COMMAND.COM" ::COMMAND.COM
+
+printf '%s\r\n' \
+  '@ECHO OFF' \
+  'ECHO GRDOS-TEST-BEGIN>AUX' \
+  'VER>AUX' \
+  'DIR>AUX' \
+  'ECHO hello>HELLO.TXT' \
+  'COPY HELLO.TXT HELLO2.TXT>AUX' \
+  'TYPE HELLO2.TXT>AUX' \
+  'ECHO GRDOS-TEST-END>AUX' \
+  > "$out/AUTOEXEC.BAT"
+mcopy -i "$img" "$out/AUTOEXEC.BAT" ::AUTOEXEC.BAT
+
+qemu-system-i386 --version | head -1 > "$out/qemu.version"
+
+timeout "$timeout_secs" qemu-system-i386 \
+  -display none -m 4 -no-reboot \
+  -drive file="$img",if=floppy,format=raw \
+  -boot a \
+  -serial file:"$out/serial.log" \
+  -monitor none \
+  > "$out/qemu.log" 2>&1 || true
+
+tr -d '\r' < "$out/serial.log" > "$out/serial.txt" || true
+cat "$out/serial.txt"
+grep -q '^GRDOS-TEST-END' "$out/serial.txt"

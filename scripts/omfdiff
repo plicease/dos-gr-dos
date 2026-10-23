@@ -1,0 +1,159 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+
+# ABSTRACT: Compare the segment contents of two 16-bit OMF object files
+
+=head1 SYNOPSIS
+
+ scripts/omfdiff [-v] MASM.OBJ JWASM.OBJ
+ scripts/omfdiff [-v] --dump FILE.OBJ
+
+=head1 DESCRIPTION
+
+Rebuilds each segment's image from the C<LEDATA> and C<LIDATA> records of two
+object files and compares them by segment name, reporting the segment sizes
+and the first differing offset.  Fixup records are summarised by count and,
+with C<-v>, listed, so that differences in relocation targets show up too.
+Exits non-zero if any segment differs.
+
+This is the M2 tool for checking that JWasm produces the same code and data
+as MASM for each module, before linking.
+
+=cut
+
+sub index_field ($data, $pos) {
+  my $b = ord substr($$data, $$pos++, 1);
+  return $b unless $b & 0x80;
+  return (($b & 0x7f) << 8) | ord substr($$data, $$pos++, 1);
+}
+
+sub lidata_block ($data, $pos) {
+  my $repeat = unpack 'v', substr($$data, $$pos, 2); $$pos += 2;
+  my $blocks = unpack 'v', substr($$data, $$pos, 2); $$pos += 2;
+  my $content = '';
+  if($blocks == 0) {
+    my $len = ord substr($$data, $$pos++, 1);
+    $content = substr($$data, $$pos, $len);
+    $$pos += $len;
+  } else {
+    $content .= lidata_block($data, $pos) for 1 .. $blocks;
+  }
+  return $content x $repeat;
+}
+
+sub parse ($path) {
+  open my $fh, '<:raw', $path or die "unable to read $path: $!";
+  local $/;
+  my $obj = <$fh>;
+
+  my(@lnames, @segs, %image, @fixups);
+  my $last;   # [seg, offset] of the last data record, for fixup locations
+  my $pos = 0;
+  while($pos < length $obj) {
+    my($type, $len) = unpack 'C v', substr($obj, $pos, 3);
+    my $rec = substr($obj, $pos + 3, $len - 1);
+    $pos += 3 + $len;
+    my $p = 0;
+    if($type == 0x96) {        # LNAMES
+      while($p < length $rec) {
+        my $n = ord substr($rec, $p++, 1);
+        push @lnames, substr($rec, $p, $n);
+        $p += $n;
+      }
+    } elsif($type == 0x98 || $type == 0x99) {   # SEGDEF
+      my $acbp = ord substr($rec, $p++, 1);
+      $p += 3 if ($acbp >> 5) == 0;
+      my $size = $type == 0x98 ? unpack('v', substr($rec, $p, 2)) : unpack('V', substr($rec, $p, 4));
+      $p += $type == 0x98 ? 2 : 4;
+      $size = 0x10000 if $acbp & 0x02;
+      my $name  = $lnames[index_field(\$rec, \$p) - 1];
+      my $class = $lnames[index_field(\$rec, \$p) - 1];
+      push @segs, { name => uc "$name/$class", size => $size };
+      $image{uc "$name/$class"} //= '';
+    } elsif($type == 0xA0 || $type == 0xA2) {   # LEDATA / LIDATA
+      my $seg = $segs[index_field(\$rec, \$p) - 1]{name};
+      my $off = unpack 'v', substr($rec, $p, 2); $p += 2;
+      my $bytes = '';
+      if($type == 0xA0) {
+        $bytes = substr($rec, $p);
+      } else {
+        $bytes .= lidata_block(\$rec, \$p) while $p < length $rec;
+      }
+      my $img = \$image{$seg};
+      $$img .= "\0" x ($off - length $$img) if length $$img < $off;
+      substr($$img, $off, length $bytes) = $bytes;
+      $last = [$seg, $off];
+    } elsif($type == 0x9C && $last) {         # FIXUPP (locations only)
+      while($p < length $rec) {
+        my $b = ord substr($rec, $p, 1);
+        if($b & 0x80) {
+          my $loc = unpack('n', substr($rec, $p, 2)) & 0x3ff;
+          $p += 2;
+          my $fixdat = ord substr($rec, $p++, 1);
+          index_field(\$rec, \$p) unless $fixdat & 0x80 || (($fixdat >> 4) & 7) > 2;
+          index_field(\$rec, \$p) unless $fixdat & 0x08 || ($fixdat & 3) > 2;
+          $p += 2 unless $fixdat & 0x04;
+          push @fixups, sprintf '%s+%04X', $last->[0], $last->[1] + $loc;
+        } else {
+          my $method = ($b >> 2) & 7;
+          $p++;
+          index_field(\$rec, \$p) if $method < 3 || $b & 0x40 == 0;
+        }
+      }
+    }
+  }
+  my %size = map { $_->{name} => $_->{size} } @segs;
+  return { image => \%image, size => \%size, fixups => [ sort @fixups ] };
+}
+
+sub main (@args) {
+  my $verbose = @args && $args[0] eq '-v' ? shift @args : 0;
+  if(@args == 2 && $args[0] eq '--dump') {
+    my $o = parse($args[1]);
+    printf "%-32s %6d bytes\n", $_, $o->{size}{$_} for sort keys $o->{size}->%*;
+    say "fixups: ", scalar $o->{fixups}->@*;
+    return 0;
+  }
+  die "usage: $0 [-v] A.OBJ B.OBJ | --dump FILE.OBJ\n" unless @args == 2;
+
+  my($a, $b) = map { parse($_) } @args;
+  my $differ = 0;
+  my %names = map { $_ => 1 } keys $a->{size}->%*, keys $b->{size}->%*;
+  for my $name (sort keys %names) {
+    my($sa, $sb) = ($a->{size}{$name}, $b->{size}{$name});
+    my($ia, $ib) = ($a->{image}{$name} // '', $b->{image}{$name} // '');
+    if(!defined $sa || !defined $sb) {
+      printf "%-32s only in %s\n", $name, defined $sa ? 'first' : 'second';
+      $differ = 1;
+      next;
+    }
+    my $first;
+    my $max = length $ia > length $ib ? length $ia : length $ib;
+    for my $i (0 .. $max - 1) {
+      if(substr($ia, $i, 1) ne substr($ib, $i, 1)) { $first = $i; last }
+    }
+    if($sa == $sb && !defined $first) {
+      say sprintf "%-32s same (%d bytes)", $name, $sa if $verbose;
+      next;
+    }
+    $differ = 1;
+    printf "%-32s size %d vs %d, first difference at %s\n", $name, $sa, $sb,
+      defined $first ? sprintf('%04Xh', $first) : 'end';
+  }
+  my($fa, $fb) = ($a->{fixups}, $b->{fixups});
+  if("@$fa" ne "@$fb") {
+    $differ = 1;
+    printf "fixup locations differ: %d vs %d\n", scalar @$fa, scalar @$fb;
+    if($verbose) {
+      my %in_b = map { $_ => 1 } @$fb;
+      my %in_a = map { $_ => 1 } @$fa;
+      say "  only first:  $_" for grep { !$in_b{$_} } @$fa;
+      say "  only second: $_" for grep { !$in_a{$_} } @$fb;
+    }
+  }
+  return $differ;
+}
+
+exit main(@ARGV);

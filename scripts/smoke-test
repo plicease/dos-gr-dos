@@ -1,0 +1,121 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+use Time::HiRes qw( sleep time );
+
+# ABSTRACT: Boot a GR-DOS image in headless QEMU and check its serial output
+
+=head1 SYNOPSIS
+
+ scripts/smoke-test [--timeout SECONDS] IMAGE EXPECT OUTDIR
+
+=head1 DESCRIPTION
+
+Boots the floppy image C<IMAGE> in headless C<qemu-system-i386> with COM1
+written to F<OUTDIR/serial.log> (decision 13).  The image's F<AUTOEXEC.BAT>
+reports to C<AUX>, and ends with the line C<GRDOS-TEST-END>.  QEMU is
+stopped when that line arrives, or after C<--timeout> seconds (default 60),
+since DOS keeps running at the prompt.
+
+The serial output, without carriage returns, is printed and saved as
+F<OUTDIR/serial.txt>, and the QEMU version as F<OUTDIR/qemu.version>.  The
+file C<EXPECT> holds one Perl regular expression per line (blank lines and
+lines starting with C<#> are ignored); each must match a line of the output,
+in order.  Exits non-zero if any does not.
+
+=cut
+
+my $end_marker = 'GRDOS-TEST-END';
+
+sub slurp ($path) {
+  open my $fh, '<:raw', $path or return '';
+  local $/;
+  return scalar <$fh>;
+}
+
+sub boot ($image, $outdir, $timeout) {
+  my $serial = "$outdir/serial.log";
+  unlink $serial;
+  my @cmd = (
+    'qemu-system-i386',
+    -display => 'none',
+    -m       => 4,
+    '-no-reboot',
+    -drive   => "file=$image,if=floppy,format=raw,snapshot=on",
+    -boot    => 'a',
+    -serial  => "file:$serial",
+    -monitor => 'none',
+  );
+
+  my $pid = fork // die "fork: $!";
+  if($pid == 0) {
+    open STDOUT, '>', "$outdir/qemu.log" or die "unable to write $outdir/qemu.log: $!";
+    open STDERR, '>&', \*STDOUT or die "dup: $!";
+    exec @cmd or die "exec qemu-system-i386: $!";
+  }
+
+  my $deadline = time + $timeout;
+  my $finished = 0;
+  while(time < $deadline) {
+    if(slurp($serial) =~ /^\Q$end_marker\E\r?$/m) {
+      $finished = 1;
+      last;
+    }
+    last if waitpid($pid, 1) == $pid;   # QEMU exited early
+    sleep 0.25;
+  }
+  kill 'TERM', $pid;
+  waitpid $pid, 0;
+  warn "smoke-test: no $end_marker within $timeout seconds\n" unless $finished;
+  return slurp($serial) =~ s/\r//gr;
+}
+
+sub main (@args) {
+  my $timeout = 60;
+  if(@args && $args[0] eq '--timeout') {
+    shift @args;
+    $timeout = shift @args;
+  }
+  die "usage: $0 [--timeout SECONDS] IMAGE EXPECT OUTDIR\n" unless @args == 3;
+  my($image, $expect, $outdir) = @args;
+  mkdir $outdir unless -d $outdir;
+
+  my $version = `qemu-system-i386 --version`;
+  die "qemu-system-i386 not found\n" unless $? == 0;
+  open my $fh, '>', "$outdir/qemu.version" or die "unable to write $outdir/qemu.version: $!";
+  print $fh $version;
+  close $fh;
+  print $version =~ /^(.*)$/m;
+  print "\n";
+
+  my $output = boot($image, $outdir, $timeout);
+  open $fh, '>', "$outdir/serial.txt" or die "unable to write $outdir/serial.txt: $!";
+  print $fh $output;
+  close $fh;
+  print $output;
+
+  my @lines = split /\n/, $output;
+  my $at = 0;
+  my $failed = 0;
+  for my $pattern (grep { /\S/ && !/^#/ } split /\n/, slurp($expect)) {
+    my $re = qr/$pattern/;
+    my $found;
+    for my $i ($at .. $#lines) {
+      if($lines[$i] =~ $re) {
+        $found = $i;
+        last;
+      }
+    }
+    if(defined $found) {
+      $at = $found + 1;
+    } else {
+      say "smoke-test: not found: $pattern";
+      $failed = 1;
+    }
+  }
+  say $failed ? 'smoke-test: FAILED' : 'smoke-test: passed';
+  return $failed;
+}
+
+exit main(@ARGV);
